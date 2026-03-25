@@ -1,10 +1,5 @@
-interface EmailData {
-  id: string;
-  subject: string;
-  from: string;
-  date: string;
-  body: string;
-}
+import type { GmailMessage } from "@/lib/gmail";
+import { buildEmailTextContext } from "@/lib/gmail";
 
 const JOB_PLATFORM_DOMAINS = [
   "linkedin.com",
@@ -77,6 +72,9 @@ const STRONG_JOB_KEYWORDS = [
   "move forward",
   "candidate home",
   "candidate portal",
+  "job number",
+  "req id",
+  "requisition id",
 ];
 
 const WEAK_JOB_KEYWORDS = [
@@ -89,8 +87,8 @@ const WEAK_JOB_KEYWORDS = [
   "next steps",
   "phone screen",
   "coding challenge",
-  "thank you for applying",
   "application submitted",
+  "job number",
 ];
 
 const LIFECYCLE_SIGNAL_PATTERNS = [
@@ -110,6 +108,8 @@ const LIFECYCLE_SIGNAL_PATTERNS = [
   "not moving forward",
   "candidacy",
   "next steps",
+  "job number",
+  "req id",
 ];
 
 const HIGH_CONFIDENCE_LIFECYCLE_PATTERNS = [
@@ -135,6 +135,7 @@ const HIGH_CONFIDENCE_LIFECYCLE_PATTERNS = [
   "your candidacy",
   "candidate home",
   "candidate portal",
+  "submit your application for",
 ];
 
 const REJECTION_PATTERNS = [
@@ -163,7 +164,6 @@ const REJECTION_PATTERNS = [
   "discover jobs",
   "jobs like this",
   "based on your profile",
-  "matched jobs",
 ];
 
 const RECRUITING_SENDER_HINTS = [
@@ -200,6 +200,7 @@ const RECIPIENT_SPECIFIC_PATTERNS = [
   "pleased to offer",
   "regret to inform",
   "not moving forward",
+  "job number",
 ];
 
 const LIVE_EVENT_NOISE_PATTERNS = [
@@ -235,13 +236,23 @@ export interface JobEmailClassification {
   negatives: string[];
 }
 
-function normalizeText(subject: string, body: string): string {
-  return `${subject} ${body.slice(0, 1200)}`.toLowerCase();
+type EmailContent = Pick<GmailMessage, "subject" | "from" | "textBody" | "links" | "images">;
+
+function normalizeAnalysisText(email: EmailContent): string {
+  return buildEmailTextContext(
+    {
+      subject: email.subject,
+      textBody: email.textBody,
+      links: email.links,
+      images: email.images,
+    },
+    12_000,
+  ).toLowerCase();
 }
 
 function extractDomain(fromField: string): string {
   const emailMatch =
-    fromField.match(/<([^>]+)>/) || fromField.match(/[\w.-]+@([\w.-]+)/);
+    fromField.match(/<([^>]+)>/) || fromField.match(/[A-Z0-9._%+-]+@([A-Z0-9.-]+\.[A-Z]{2,})/i);
 
   if (emailMatch) {
     const email = emailMatch[1] || emailMatch[0];
@@ -256,7 +267,7 @@ function isFromJobPlatform(from: string): boolean {
   const domain = extractDomain(from);
   return JOB_PLATFORM_DOMAINS.some(
     (platformDomain) =>
-      domain === platformDomain || domain.endsWith(`.${platformDomain}`)
+      domain === platformDomain || domain.endsWith(`.${platformDomain}`),
   );
 }
 
@@ -266,7 +277,7 @@ function isCareerSiteSender(from: string): boolean {
 
   const lowerFrom = from.toLowerCase();
   return CAREER_SITE_DOMAIN_HINTS.some(
-    (hint) => domain.includes(hint) || lowerFrom.includes(hint)
+    (hint) => domain.includes(hint) || lowerFrom.includes(hint),
   );
 }
 
@@ -274,7 +285,7 @@ function isBlockedSender(from: string): boolean {
   const domain = extractDomain(from);
   return BLOCKED_SENDER_DOMAINS.some(
     (blockedDomain) =>
-      domain === blockedDomain || domain.endsWith(`.${blockedDomain}`)
+      domain === blockedDomain || domain.endsWith(`.${blockedDomain}`),
   );
 }
 
@@ -283,87 +294,41 @@ function hasRecruitingSenderHint(from: string): boolean {
   return RECRUITING_SENDER_HINTS.some((hint) => lowerFrom.includes(hint));
 }
 
-function hasStrongJobKeywords(subject: string, body: string): boolean {
-  const text = normalizeText(subject, body);
-  return STRONG_JOB_KEYWORDS.some((keyword) =>
-    text.includes(keyword.toLowerCase())
+function containsPattern(text: string, patterns: string[]): boolean {
+  return patterns.some((pattern) => text.includes(pattern.toLowerCase()));
+}
+
+export function isPromotionalOrDigestEmail(email: EmailContent): boolean {
+  const text = normalizeAnalysisText(email);
+  return (
+    containsPattern(text, REJECTION_PATTERNS) ||
+    containsPattern(text, LIVE_EVENT_NOISE_PATTERNS)
   );
 }
 
-function hasWeakJobKeywords(subject: string, body: string): boolean {
-  const text = normalizeText(subject, body);
-  return WEAK_JOB_KEYWORDS.some((keyword) =>
-    text.includes(keyword.toLowerCase())
-  );
+export function hasHighConfidenceLifecycleSignal(email: EmailContent): boolean {
+  return containsPattern(normalizeAnalysisText(email), HIGH_CONFIDENCE_LIFECYCLE_PATTERNS);
 }
 
-function hasLifecycleSignals(subject: string, body: string): boolean {
-  const text = normalizeText(subject, body);
-  return LIFECYCLE_SIGNAL_PATTERNS.some((pattern) =>
-    text.includes(pattern.toLowerCase())
-  );
-}
-
-function hasRecipientSpecificContext(subject: string, body: string): boolean {
-  const text = normalizeText(subject, body);
-  return RECIPIENT_SPECIFIC_PATTERNS.some((pattern) =>
-    text.includes(pattern.toLowerCase())
-  );
-}
-
-function hasLiveEventNoise(subject: string, body: string): boolean {
-  const text = normalizeText(subject, body);
-  return LIVE_EVENT_NOISE_PATTERNS.some((pattern) =>
-    text.includes(pattern.toLowerCase())
-  );
-}
-
-function isJobAlertDigest(subject: string, body: string): boolean {
-  const text = normalizeText(subject, body);
-  return REJECTION_PATTERNS.some((pattern) =>
-    text.includes(pattern.toLowerCase())
-  );
-}
-
-export function isPromotionalOrDigestEmail(
-  subject: string,
-  body: string
-): boolean {
-  return isJobAlertDigest(subject, body) || hasLiveEventNoise(subject, body);
-}
-
-export function hasHighConfidenceLifecycleSignal(
-  subject: string,
-  body: string
-): boolean {
-  const text = normalizeText(subject, body);
-  return HIGH_CONFIDENCE_LIFECYCLE_PATTERNS.some((pattern) =>
-    text.includes(pattern)
-  );
-}
-
-export function classifyJobEmail(
-  from: string,
-  subject: string,
-  body: string
-): JobEmailClassification {
+export function classifyJobEmail(email: EmailContent): JobEmailClassification {
   const positives: string[] = [];
   const negatives: string[] = [];
 
-  const fromPlatform = isFromJobPlatform(from);
-  const fromCareerSite = isCareerSiteSender(from);
-  const recruitingSender = hasRecruitingSenderHint(from);
-  const blockedSender = isBlockedSender(from);
-  const promotionalOrDigest = isJobAlertDigest(subject, body);
-  const liveEventNoise = hasLiveEventNoise(subject, body);
-  const highConfidenceLifecycle = hasHighConfidenceLifecycleSignal(
-    subject,
-    body
+  const fromPlatform = isFromJobPlatform(email.from);
+  const fromCareerSite = isCareerSiteSender(email.from);
+  const recruitingSender = hasRecruitingSenderHint(email.from);
+  const blockedSender = isBlockedSender(email.from);
+  const text = normalizeAnalysisText(email);
+  const promotionalOrDigest = containsPattern(text, REJECTION_PATTERNS);
+  const liveEventNoise = containsPattern(text, LIVE_EVENT_NOISE_PATTERNS);
+  const highConfidenceLifecycle = containsPattern(
+    text,
+    HIGH_CONFIDENCE_LIFECYCLE_PATTERNS,
   );
-  const lifecycleSignal = hasLifecycleSignals(subject, body);
-  const recipientContext = hasRecipientSpecificContext(subject, body);
-  const strongKeywords = hasStrongJobKeywords(subject, body);
-  const weakKeywords = hasWeakJobKeywords(subject, body);
+  const lifecycleSignal = containsPattern(text, LIFECYCLE_SIGNAL_PATTERNS);
+  const recipientContext = containsPattern(text, RECIPIENT_SPECIFIC_PATTERNS);
+  const strongKeywords = containsPattern(text, STRONG_JOB_KEYWORDS);
+  const weakKeywords = containsPattern(text, WEAK_JOB_KEYWORDS);
 
   if (fromPlatform) positives.push("known-platform-sender");
   if (fromCareerSite) positives.push("career-site-sender");
@@ -427,8 +392,6 @@ export function detectPlatform(from: string): string | null {
   return null;
 }
 
-export function filterJobEmails(emails: EmailData[]): EmailData[] {
-  return emails.filter((email) =>
-    classifyJobEmail(email.from, email.subject, email.body).shouldProcess
-  );
+export function filterJobEmails(emails: EmailContent[]): EmailContent[] {
+  return emails.filter((email) => classifyJobEmail(email).shouldProcess);
 }

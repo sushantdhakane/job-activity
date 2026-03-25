@@ -46,6 +46,17 @@ export async function GET(request: NextRequest) {
     // Fetch applications
     const applications = await prisma.jobApplication.findMany({
       where,
+      include: {
+        companyProfile: {
+          select: {
+            id: true,
+            displayName: true,
+            logoUrl: true,
+            logoDataUrl: true,
+            logoSource: true,
+          },
+        },
+      },
       orderBy: { [sortBy]: sortOrder },
     });
 

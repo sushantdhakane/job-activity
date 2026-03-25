@@ -1,13 +1,42 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { signOut } from "next-auth/react";
+import {
+  BriefcaseBusinessIcon,
+  CalendarDaysIcon,
+  GhostIcon,
+  LoaderCircleIcon,
+  LogOutIcon,
+  MailCheckIcon,
+  SearchIcon,
+  SendIcon,
+  SparklesIcon,
+  TargetIcon,
+  TriangleAlertIcon,
+  XCircleIcon,
+} from "lucide-react";
+
 import { isNeedsReviewApplicationRecord } from "@/lib/application-quality";
+import { cn } from "@/lib/utils";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
 
 interface JobApplication {
   id: string;
   company: string;
-  role: string;
+  role: string | null;
   dateApplied: string | null;
   status: string;
   interviewRound: string | null;
@@ -15,6 +44,13 @@ interface JobApplication {
   emailSubject: string;
   emailDate: string;
   createdAt: string;
+  companyProfile?: {
+    id: string;
+    displayName: string;
+    logoUrl: string | null;
+    logoDataUrl: string | null;
+    logoSource: string | null;
+  } | null;
 }
 
 interface DashboardData {
@@ -45,16 +81,290 @@ interface DashboardProps {
 }
 
 const STATUS_CONFIG = {
-  applied: { color: "var(--info)", label: "Applied", icon: "📤" },
-  interviewing: {
-    color: "var(--warning)",
-    label: "Interviewing",
-    icon: "🎯",
+  applied: {
+    label: "Applied",
+    icon: SendIcon,
+    badgeTone: "border-sky-200 bg-sky-50 text-sky-700",
   },
-  offered: { color: "var(--success)", label: "Offered", icon: "🎉" },
-  rejected: { color: "var(--danger)", label: "Rejected", icon: "❌" },
-  ghosted: { color: "var(--purple)", label: "Ghosted", icon: "👻" },
-};
+  interviewing: {
+    label: "Interviewing",
+    icon: TargetIcon,
+    badgeTone: "border-amber-200 bg-amber-50 text-amber-700",
+  },
+  offered: {
+    label: "Offered",
+    icon: SparklesIcon,
+    badgeTone: "border-emerald-200 bg-emerald-50 text-emerald-700",
+  },
+  rejected: {
+    label: "Rejected",
+    icon: XCircleIcon,
+    badgeTone: "border-rose-200 bg-rose-50 text-rose-700",
+  },
+  ghosted: {
+    label: "Ghosted",
+    icon: GhostIcon,
+    badgeTone: "border-slate-200 bg-slate-100 text-slate-600",
+  },
+} as const;
+
+const PIPELINE_COLUMNS = [
+  {
+    key: "wishlist",
+    label: "Wishlist",
+    description: "Fresh applications and recent sends.",
+    accentClass: "bg-slate-900",
+    emptyLabel: "New applications land here first.",
+  },
+  {
+    key: "recruiter-call",
+    label: "Recruiter call",
+    description: "Screens, intros, and first replies.",
+    accentClass: "bg-sky-500",
+    emptyLabel: "Intro calls and phone screens show up here.",
+  },
+  {
+    key: "portfolio-review",
+    label: "Portfolio review",
+    description: "Portfolio deep-dives and case reviews.",
+    accentClass: "bg-violet-500",
+    emptyLabel: "Portfolio review stages are still open.",
+  },
+  {
+    key: "assignment",
+    label: "Assignment / Whiteboard",
+    description: "Take-homes, exercises, and whiteboards.",
+    accentClass: "bg-amber-500",
+    emptyLabel: "No assignments are active right now.",
+  },
+  {
+    key: "product-culture",
+    label: "Product & culture",
+    description: "Panel, team, final, and culture rounds.",
+    accentClass: "bg-emerald-500",
+    emptyLabel: "Later-stage interviews will collect here.",
+  },
+  {
+    key: "not-selected",
+    label: "Not selected",
+    description: "Rejections and long-tail ghosting.",
+    accentClass: "bg-rose-500",
+    emptyLabel: "Nothing closed out in this view.",
+  },
+  {
+    key: "offer-received",
+    label: "Offer received",
+    description: "Live offers worth comparing carefully.",
+    accentClass: "bg-teal-500",
+    emptyLabel: "Offers will stay isolated here.",
+  },
+] as const;
+
+const SORT_OPTIONS = [
+  { value: "emailDate:desc", label: "Newest activity" },
+  { value: "emailDate:asc", label: "Oldest activity" },
+  { value: "company:asc", label: "Company A-Z" },
+  { value: "company:desc", label: "Company Z-A" },
+  { value: "status:asc", label: "Status A-Z" },
+];
+
+const ALL_PLATFORMS_VALUE = "__all-platforms__";
+
+type PipelineColumnKey = (typeof PIPELINE_COLUMNS)[number]["key"];
+
+function getInitials(value: string | null | undefined): string {
+  const cleaned = (value || "").trim();
+  if (!cleaned) return "JT";
+
+  const parts = cleaned.split(/\s+/).filter(Boolean).slice(0, 2);
+  return parts.map((part) => part[0]?.toUpperCase() || "").join("") || "JT";
+}
+
+function getGreeting(name: string | null | undefined): string {
+  const firstName = name?.trim().split(/\s+/)[0] || "there";
+  const hour = new Date().getHours();
+
+  if (hour < 12) return `Good morning, ${firstName}`;
+  if (hour < 18) return `Good afternoon, ${firstName}`;
+  return `Good evening, ${firstName}`;
+}
+
+function formatDate(dateStr: string | null): string {
+  if (!dateStr) return "—";
+
+  try {
+    return new Date(dateStr).toLocaleDateString("en-IN", {
+      day: "numeric",
+      month: "short",
+      year: "numeric",
+    });
+  } catch {
+    return "—";
+  }
+}
+
+function formatTime(dateStr: string | null): string {
+  if (!dateStr) return "—";
+
+  try {
+    return new Date(dateStr).toLocaleTimeString("en-IN", {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return "—";
+  }
+}
+
+function getApplicationSource(platform: string | null): string {
+  return platform?.trim() || "Company careers page";
+}
+
+function getPipelineColumn(app: JobApplication): PipelineColumnKey {
+  if (app.status === "offered") {
+    return "offer-received";
+  }
+
+  if (app.status === "rejected" || app.status === "ghosted") {
+    return "not-selected";
+  }
+
+  if (app.status === "interviewing") {
+    const round = (app.interviewRound || "").toLowerCase();
+
+    if (round.includes("portfolio")) {
+      return "portfolio-review";
+    }
+
+    if (
+      round.includes("assignment") ||
+      round.includes("whiteboard") ||
+      round.includes("take home") ||
+      round.includes("take-home") ||
+      round.includes("case study")
+    ) {
+      return "assignment";
+    }
+
+    if (
+      round.includes("culture") ||
+      round.includes("final") ||
+      round.includes("panel") ||
+      round.includes("onsite") ||
+      round.includes("team") ||
+      round.includes("manager")
+    ) {
+      return "product-culture";
+    }
+
+    return "recruiter-call";
+  }
+
+  return "wishlist";
+}
+function SummaryCard({
+  label,
+  value,
+  hint,
+}: {
+  label: string;
+  value: number;
+  hint: string;
+}) {
+  return (
+    <div className="rounded-[24px] border border-[#e7e3d8] bg-white p-5">
+      <p className="text-4xl font-semibold tracking-tight text-slate-900">
+        {value}
+      </p>
+      <p className="mt-2 text-sm font-medium text-slate-900">{label}</p>
+      <p className="mt-1 text-sm text-[#667085]">{hint}</p>
+    </div>
+  );
+}
+
+function ApplicationCard({
+  app,
+}: {
+  app: JobApplication;
+}) {
+  return (
+    <article className="flex h-[178px] flex-col rounded-[22px] border border-[#e7e3d8] bg-white p-4 shadow-[0_10px_30px_rgba(15,23,42,0.04)] transition-transform duration-200 hover:-translate-y-0.5">
+      <div className="flex items-start gap-3">
+        <Avatar className="size-11 rounded-2xl">
+          <AvatarImage
+            src={
+              app.companyProfile?.logoDataUrl ||
+              app.companyProfile?.logoUrl ||
+              undefined
+            }
+            alt={app.company}
+            className="rounded-2xl object-contain bg-white p-1"
+          />
+          <AvatarFallback className="rounded-2xl bg-[#f3efe4] text-sm font-semibold text-slate-700">
+            {getInitials(app.company)}
+          </AvatarFallback>
+        </Avatar>
+        <div className="min-w-0 pt-0.5">
+          <p className="truncate text-base font-semibold text-slate-900">
+            {app.company}
+          </p>
+        </div>
+      </div>
+
+      <div className="mt-5 flex flex-1 flex-col justify-between">
+        <p
+          className="line-clamp-2 min-h-[52px] text-[17px] leading-6 font-medium text-[#344054]"
+          title={app.role || "Role pending review"}
+        >
+          {app.role || "Role pending review"}
+        </p>
+        <p
+          className="line-clamp-1 text-sm text-[#667085]"
+          title={getApplicationSource(app.platform)}
+        >
+          {getApplicationSource(app.platform)}
+        </p>
+      </div>
+    </article>
+  );
+}
+
+function PipelineColumn({
+  column,
+  applications,
+}: {
+  column: (typeof PIPELINE_COLUMNS)[number];
+  applications: JobApplication[];
+}) {
+  return (
+    <section className="flex w-[290px] flex-col rounded-[28px] border border-[#e7e3d8] bg-[#f3efe4] p-3">
+      <div className="rounded-[22px] bg-white/85 p-4">
+        <div className="flex items-center gap-3">
+          <span className={cn("size-3 rounded-full", column.accentClass)} />
+          <div>
+            <p className="text-lg font-semibold text-slate-900">{column.label}</p>
+            <p className="mt-1 text-sm leading-6 text-[#667085]">
+              {column.description}
+            </p>
+          </div>
+        </div>
+        <div className="mt-4 inline-flex rounded-full bg-[#f6f2e8] px-3 py-1 text-sm font-medium text-slate-700">
+          {applications.length}
+        </div>
+      </div>
+
+      <div className="mt-3 flex flex-1 flex-col gap-3">
+        {applications.length > 0 ? (
+          applications.map((app) => <ApplicationCard key={app.id} app={app} />)
+        ) : (
+          <div className="flex flex-1 items-center rounded-[22px] border border-dashed border-[#d7d2c3] bg-[#faf8f2] px-4 py-10 text-center text-sm leading-6 text-[#667085]">
+            {column.emptyLabel}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
 
 export function Dashboard({ user }: DashboardProps) {
   const [data, setData] = useState<DashboardData | null>(null);
@@ -67,10 +377,11 @@ export function Dashboard({ user }: DashboardProps) {
   const [sortBy, setSortBy] = useState("emailDate");
   const [sortOrder, setSortOrder] = useState<"asc" | "desc">("desc");
   const [syncSummary, setSyncSummary] = useState<SyncSummary | null>(null);
-  const [editingId, setEditingId] = useState<string | null>(null);
+  const [searchInput, setSearchInput] = useState("");
 
   const fetchData = useCallback(async () => {
     setLoading(true);
+
     try {
       const params = new URLSearchParams();
       if (filter) params.set("status", filter);
@@ -79,39 +390,42 @@ export function Dashboard({ user }: DashboardProps) {
       params.set("sortBy", sortBy);
       params.set("sortOrder", sortOrder);
 
-      const res = await fetch(`/api/applications?${params}`);
+      const res = await fetch(`/api/applications?${params.toString()}`);
       if (res.ok) {
-        const json = await res.json();
+        const json = (await res.json()) as DashboardData;
         setData(json);
       }
     } catch (err) {
-      console.error("Failed to fetch:", err);
+      console.error("Failed to fetch applications:", err);
     } finally {
       setLoading(false);
     }
   }, [filter, platform, search, sortBy, sortOrder]);
 
   useEffect(() => {
-    fetchData();
+    void fetchData();
   }, [fetchData]);
 
-  // Debounced search
-  const [searchInput, setSearchInput] = useState("");
   useEffect(() => {
-    const timer = setTimeout(() => setSearch(searchInput), 300);
-    return () => clearTimeout(timer);
+    const timer = window.setTimeout(() => {
+      setSearch(searchInput.trim());
+    }, 250);
+
+    return () => window.clearTimeout(timer);
   }, [searchInput]);
 
   const handleSync = async () => {
     setSyncing(true);
+
     try {
       const res = await fetch("/api/sync", { method: "POST" });
       const json = (await res.json()) as SyncSummary;
+
       if (res.ok) {
         setSyncSummary(json);
         await fetchData();
       } else {
-        console.error("Sync error:", json);
+        console.error("Sync failed:", json);
       }
     } catch (err) {
       console.error("Sync failed:", err);
@@ -120,482 +434,504 @@ export function Dashboard({ user }: DashboardProps) {
     }
   };
 
-  const handleStatusChange = async (id: string, newStatus: string) => {
-    try {
-      const res = await fetch("/api/applications", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id, status: newStatus }),
-      });
-      if (res.ok) {
-        setEditingId(null);
-        await fetchData();
-      }
-    } catch (err) {
-      console.error("Update failed:", err);
-    }
-  };
-
-  const formatDate = (dateStr: string | null) => {
-    if (!dateStr) return "—";
-    try {
-      return new Date(dateStr).toLocaleDateString("en-IN", {
-        day: "numeric",
-        month: "short",
-        year: "numeric",
-      });
-    } catch {
-      return "—";
-    }
+  const clearFilters = () => {
+    setFilter("");
+    setPlatform("");
+    setSearch("");
+    setSearchInput("");
+    setShowNeedsReview(false);
   };
 
   const totalApps = data
-    ? Object.values(data.stats).reduce((a, b) => a + b, 0)
+    ? Object.values(data.stats).reduce((sum, count) => sum + count, 0)
     : 0;
+
+  const activeApplications =
+    (data?.stats.applied || 0) + (data?.stats.interviewing || 0);
+
+  const reviewCount = (data?.applications || []).filter((app) =>
+    isNeedsReviewApplicationRecord(app)
+  ).length;
+
+  const displayedApplications = (data?.applications || []).filter((app) =>
+    showNeedsReview ? isNeedsReviewApplicationRecord(app) : true
+  );
 
   const uniquePlatforms = Array.from(
     new Set(
       (data?.applications || [])
-        .map((app) => app.platform)
+        .map((application) => application.platform)
         .filter((value): value is string => Boolean(value))
     )
   ).sort((a, b) => a.localeCompare(b));
 
-  const isLowQualityRecord = (app: JobApplication) =>
-    isNeedsReviewApplicationRecord(app);
+  const currentSortValue = `${sortBy}:${sortOrder}`;
+  const selectedPlatformValue = platform || ALL_PLATFORMS_VALUE;
+  const hasActiveFilters = Boolean(filter || platform || search || showNeedsReview);
 
-  const displayedApplications = (data?.applications || []).filter((app) =>
-    showNeedsReview ? isLowQualityRecord(app) : true
-  );
+  const pipelineColumns = PIPELINE_COLUMNS.map((column) => ({
+    ...column,
+    applications: displayedApplications.filter(
+      (application) => getPipelineColumn(application) === column.key
+    ),
+  }));
+
+  const lastSyncLabel = data?.lastSyncAt
+    ? `${formatDate(data.lastSyncAt)} at ${formatTime(data.lastSyncAt)}`
+    : "No sync has been run yet";
 
   return (
-    <div style={{ minHeight: "100vh", padding: "24px" }}>
-      {/* Header */}
-      <header
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          marginBottom: 32,
-          maxWidth: 1200,
-          margin: "0 auto 32px",
-        }}
-      >
-        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <div
-            style={{
-              width: 40,
-              height: 40,
-              borderRadius: 10,
-              background:
-                "linear-gradient(135deg, var(--accent), var(--purple))",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              fontSize: 20,
-            }}
-          >
-            📋
-          </div>
-          <div>
-            <h1
-              style={{
-                fontSize: 20,
-                fontWeight: 700,
-                letterSpacing: "-0.02em",
-                margin: 0,
-              }}
-            >
-              Job Tracker
-            </h1>
-            <p
-              style={{
-                fontSize: 13,
-                color: "var(--text-muted)",
-                margin: 0,
-              }}
-            >
-              {user.email}
-            </p>
-          </div>
-        </div>
+    <div className="min-h-screen bg-[#f7f4ec] text-slate-900">
+      <header className="border-b border-[#e7e3d8] bg-[#fcfbf7]/95 backdrop-blur">
+        <div className="mx-auto flex w-full max-w-[1700px] flex-col gap-4 px-4 py-4 sm:px-6 lg:flex-row lg:items-center lg:justify-between lg:px-8">
+          <div className="flex flex-col gap-4 lg:flex-row lg:items-center">
+            <div className="flex items-center gap-3">
+              <div className="flex size-10 items-center justify-center rounded-2xl bg-slate-900 text-white">
+                <BriefcaseBusinessIcon className="size-4" />
+              </div>
+              <div>
+                <p className="text-sm font-semibold tracking-tight">
+                  Job Application Tracker
+                </p>
+                <p className="text-xs text-[#667085]">
+                  Clean pipeline view from your inbox
+                </p>
+              </div>
+            </div>
 
-        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <button
-            onClick={handleSync}
-            disabled={syncing}
-            className="btn-primary"
-          >
-            {syncing ? (
-              <>
-                <span className="animate-pulse-subtle">⟳</span> Syncing…
-              </>
-            ) : (
-              <>⟳ Sync Gmail</>
-            )}
-          </button>
-          <button
-            onClick={() => signOut()}
-            className="btn-ghost"
-            style={{ padding: "8px 14px" }}
-          >
-            Sign Out
-          </button>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setShowNeedsReview(false)}
+                className={cn(
+                  "inline-flex cursor-pointer items-center rounded-full border px-4 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-900/20",
+                  !showNeedsReview
+                    ? "border-slate-900 bg-slate-900 text-white"
+                    : "border-[#d7d2c3] bg-white text-slate-700 hover:bg-[#f8f5ec]"
+                )}
+              >
+                All pipeline
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowNeedsReview(true)}
+                className={cn(
+                  "inline-flex cursor-pointer items-center gap-2 rounded-full border px-4 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-900/20",
+                  showNeedsReview
+                    ? "border-slate-900 bg-slate-900 text-white"
+                    : "border-[#d7d2c3] bg-white text-slate-700 hover:bg-[#f8f5ec]"
+                )}
+              >
+                Review queue
+                <span
+                  className={cn(
+                    "rounded-full px-2 py-0.5 text-xs",
+                    showNeedsReview
+                      ? "bg-white/15 text-white"
+                      : "bg-[#f3efe4] text-slate-700"
+                  )}
+                >
+                  {reviewCount}
+                </span>
+              </button>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3">
+            <p className="hidden text-sm text-[#667085] xl:block">
+              Last sync: {lastSyncLabel}
+            </p>
+            <Button
+              onClick={handleSync}
+              disabled={syncing}
+              size="lg"
+              className="rounded-full px-4"
+            >
+              {syncing ? (
+                <>
+                  <LoaderCircleIcon
+                    data-icon="inline-start"
+                    className="animate-spin"
+                  />
+                  Syncing inbox
+                </>
+              ) : (
+                <>
+                  <MailCheckIcon data-icon="inline-start" />
+                  Sync Gmail
+                </>
+              )}
+            </Button>
+            <div className="flex items-center gap-2 rounded-full border border-[#ddd6c7] bg-white px-2 py-1.5">
+              <Avatar size="sm">
+                <AvatarImage
+                  src={user.image || undefined}
+                  alt={user.name || "User"}
+                />
+                <AvatarFallback>{getInitials(user.name || user.email)}</AvatarFallback>
+              </Avatar>
+              <span className="max-w-[160px] truncate pr-1 text-sm font-medium text-slate-700">
+                {user.name || user.email || "Your account"}
+              </span>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => signOut()}
+                className="rounded-full"
+              >
+                <LogOutIcon data-icon="inline-start" />
+                Sign out
+              </Button>
+            </div>
+          </div>
         </div>
       </header>
 
-      <main style={{ maxWidth: 1200, margin: "0 auto" }}>
-        {/* Stats Row */}
-        <div
-          className="animate-fade-in"
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
-            gap: 16,
-            marginBottom: 32,
-          }}
-        >
-          {/* Total */}
-          <div className="stat-card">
-            <div className="stat-value">{loading ? "—" : totalApps}</div>
-            <div className="stat-label">Total Applications</div>
-          </div>
-          {Object.entries(STATUS_CONFIG).map(([key, cfg]) => (
-            <div
-              key={key}
-              className="stat-card"
-              style={{ cursor: "pointer" }}
-              onClick={() => setFilter(filter === key ? "" : key)}
-            >
-              <div className="stat-value" style={{ color: cfg.color }}>
-                {loading ? "—" : data?.stats[key] || 0}
-              </div>
-              <div className="stat-label">
-                {cfg.icon} {cfg.label}
-              </div>
+      <main className="mx-auto flex w-full max-w-[1700px] flex-col gap-6 px-4 py-6 sm:px-6 lg:px-8">
+        <section className="rounded-[32px] border border-[#e7e3d8] bg-white p-6 sm:p-8">
+          <Badge
+            variant="outline"
+            className="rounded-full border-[#d7d2c3] bg-[#f8f5ec] px-3 py-1 text-[#5b6474]"
+          >
+            Board-first application tracker
+          </Badge>
+          <div className="mt-4 flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between">
+            <div>
+              <h1 className="text-3xl font-semibold tracking-tight text-slate-900 sm:text-4xl">
+                {getGreeting(user.name || user.email)}
+              </h1>
+              <p className="mt-3 max-w-3xl text-base leading-7 text-[#667085] sm:text-lg">
+                See every application stage at a glance, keep Gmail syncs close,
+                and update statuses directly from the board without dropping
+                into a spreadsheet.
+              </p>
             </div>
-          ))}
-        </div>
 
-        {/* Filters & Search */}
-        <div
-          className="glass-card"
-          style={{
-            display: "flex",
-            gap: 12,
-            marginBottom: 18,
-            flexWrap: "wrap",
-            alignItems: "center",
-            padding: 14,
-          }}
-        >
-          <input
-            type="text"
-            placeholder="Search company or role…"
-            value={searchInput}
-            onChange={(e) => setSearchInput(e.target.value)}
-            className="input-field"
-            style={{ maxWidth: 320, minWidth: 220 }}
-          />
-          <select
-            className="input-field"
-            value={platform}
-            onChange={(e) => setPlatform(e.target.value)}
-            style={{ width: 180 }}
-          >
-            <option value="">All Platforms</option>
-            {uniquePlatforms.map((p) => (
-              <option key={p} value={p}>
-                {p}
-              </option>
-            ))}
-          </select>
-
-          <select
-            className="input-field"
-            value={`${sortBy}:${sortOrder}`}
-            onChange={(e) => {
-              const [nextSortBy, nextSortOrder] = e.target.value.split(":");
-              setSortBy(nextSortBy);
-              setSortOrder(nextSortOrder as "asc" | "desc");
-            }}
-            style={{ width: 210 }}
-          >
-            <option value="emailDate:desc">Newest Email First</option>
-            <option value="emailDate:asc">Oldest Email First</option>
-            <option value="company:asc">Company A-Z</option>
-            <option value="company:desc">Company Z-A</option>
-            <option value="status:asc">Status A-Z</option>
-          </select>
-
-          <button
-            className={`btn-ghost ${showNeedsReview ? "active" : ""}`}
-            onClick={() => setShowNeedsReview((prev) => !prev)}
-          >
-            {showNeedsReview ? "Showing Needs Review" : "Needs Review Only"}
-          </button>
-
-          <div style={{ display: "flex", gap: 8 }}>
-            <button
-              className={`btn-ghost ${!filter ? "active" : ""}`}
-              onClick={() => setFilter("")}
-            >
-              All
-            </button>
-            {Object.entries(STATUS_CONFIG).map(([key, cfg]) => (
-              <button
-                key={key}
-                className={`btn-ghost ${filter === key ? "active" : ""}`}
-                onClick={() => setFilter(filter === key ? "" : key)}
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge
+                variant="outline"
+                className="h-auto rounded-full border-[#d7d2c3] bg-[#f8f5ec] px-3 py-1.5 text-[#5b6474]"
               >
-                {cfg.icon} {cfg.label}
-              </button>
-            ))}
+                {displayedApplications.length} visible
+              </Badge>
+              <Badge
+                variant="outline"
+                className="h-auto rounded-full border-[#d7d2c3] bg-[#f8f5ec] px-3 py-1.5 text-[#5b6474]"
+              >
+                {totalApps} total tracked
+              </Badge>
+              <Badge
+                variant="outline"
+                className="h-auto rounded-full border-[#d7d2c3] bg-[#f8f5ec] px-3 py-1.5 text-[#5b6474]"
+              >
+                Last sync: {lastSyncLabel}
+              </Badge>
+            </div>
           </div>
-        </div>
+        </section>
 
-        {/* Last sync info */}
-        {data?.lastSyncAt && (
-          <div
-            className="glass-card"
-            style={{
-              padding: "12px 14px",
-              marginBottom: 16,
-              display: "flex",
-              justifyContent: "space-between",
-              alignItems: "center",
-              gap: 12,
-              flexWrap: "wrap",
-            }}
-          >
-            <p
-              style={{
-                fontSize: 12,
-                color: "var(--text-muted)",
-                margin: 0,
-              }}
-            >
-              Last synced: {formatDate(data.lastSyncAt)}{" "}
-              {new Date(data.lastSyncAt).toLocaleTimeString("en-IN", {
-                hour: "2-digit",
-                minute: "2-digit",
-              })}
-            </p>
-            {syncSummary && (
-              <div
-                style={{
-                  display: "flex",
-                  gap: 10,
-                  flexWrap: "wrap",
-                  fontSize: 12,
+        <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+          <SummaryCard
+            label="Total applications"
+            value={totalApps}
+            hint="Every tracked application email in the system."
+          />
+          <SummaryCard
+            label="Active applications"
+            value={activeApplications}
+            hint="Applied plus interviewing roles still in motion."
+          />
+          <SummaryCard
+            label="Needs review"
+            value={reviewCount}
+            hint="Records with weak extraction signals to double-check."
+          />
+          <SummaryCard
+            label="Offers received"
+            value={data?.stats.offered || 0}
+            hint="Offers you can compare without losing the pipeline."
+          />
+        </section>
+
+        <section className="rounded-[32px] border border-[#e7e3d8] bg-white px-6 py-5">
+          <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
+            <div>
+              <p className="text-xl font-semibold tracking-tight text-slate-900">
+                Responses take time in early stages
+              </p>
+              <p className="mt-2 max-w-3xl text-sm leading-6 text-[#667085]">
+                Keep syncing Gmail, surface weak records before they pollute the
+                board, and move each application into the correct stage so the
+                pipeline stays calm and trustworthy.
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              {syncSummary ? (
+                <>
+                  <Badge
+                    variant="outline"
+                    className="h-auto rounded-full border-sky-200 bg-sky-50 px-3 py-1.5 text-sky-700"
+                  >
+                    Saved {syncSummary.emailsProcessed}
+                  </Badge>
+                  <Badge
+                    variant="outline"
+                    className="h-auto rounded-full border-emerald-200 bg-emerald-50 px-3 py-1.5 text-emerald-700"
+                  >
+                    New {syncSummary.newApplications}
+                  </Badge>
+                  <Badge
+                    variant="outline"
+                    className="h-auto rounded-full border-rose-200 bg-rose-50 px-3 py-1.5 text-rose-700"
+                  >
+                    Failed {syncSummary.failed || 0}
+                  </Badge>
+                </>
+              ) : (
+                <Badge
+                  variant="outline"
+                  className="h-auto rounded-full border-[#d7d2c3] bg-[#f8f5ec] px-3 py-1.5 text-[#5b6474]"
+                >
+                  Run a sync to refresh Gmail-backed application data.
+                </Badge>
+              )}
+              <Button
+                variant={showNeedsReview ? "default" : "outline"}
+                size="lg"
+                onClick={() => setShowNeedsReview((value) => !value)}
+                className="rounded-full px-4"
+              >
+                <TriangleAlertIcon data-icon="inline-start" />
+                {showNeedsReview ? "Exit review queue" : "Review weak records"}
+              </Button>
+            </div>
+          </div>
+        </section>
+
+        <section className="rounded-[32px] border border-[#e7e3d8] bg-white p-6">
+          <div className="flex flex-col gap-6">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+              <div>
+                <p className="text-xs font-medium tracking-[0.24em] text-[#98a2b3] uppercase">
+                  Application pipeline
+                </p>
+                <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-900">
+                  Your application pipeline
+                </h2>
+                <p className="mt-2 max-w-3xl text-sm leading-6 text-[#667085]">
+                  Search by company, role, source, or email subject, then move
+                  each card through the same board where you review the rest of
+                  your process.
+                </p>
+              </div>
+              {hasActiveFilters ? (
+                <Button
+                  variant="ghost"
+                  size="lg"
+                  onClick={clearFilters}
+                  className="w-full rounded-full lg:w-auto"
+                >
+                  Clear filters
+                </Button>
+              ) : null}
+            </div>
+
+            <div className="grid gap-3 lg:grid-cols-[1.4fr_0.8fr_0.8fr]">
+              <div className="relative">
+                <SearchIcon className="pointer-events-none absolute top-1/2 left-4 size-4 -translate-y-1/2 text-[#98a2b3]" />
+                <Input
+                  type="text"
+                  value={searchInput}
+                  onChange={(event) => setSearchInput(event.target.value)}
+                  placeholder="Search company, role, subject, or platform"
+                  className="h-12 rounded-2xl border-[#ddd6c7] bg-[#fcfbf7] pl-11"
+                />
+              </div>
+
+              <Select
+                value={selectedPlatformValue}
+                onValueChange={(value) => {
+                  setPlatform(
+                    value && value !== ALL_PLATFORMS_VALUE ? value : ""
+                  );
                 }}
               >
-                <span className="badge badge-applied">
-                  Saved: {syncSummary.emailsProcessed}
-                </span>
-                <span className="badge badge-offered">
-                  New: {syncSummary.newApplications}
-                </span>
-                <span className="badge badge-ghosted">
-                  Skipped: {syncSummary.skippedNotJob || 0}
-                </span>
-                <span className="badge badge-rejected">
-                  Failed: {syncSummary.failed || 0}
-                </span>
-                {syncSummary.syncDurationMs !== undefined && (
-                  <span className="badge badge-interviewing">
-                    Sync: {(syncSummary.syncDurationMs / 1000).toFixed(1)}s
-                  </span>
-                )}
-              </div>
-            )}
-          </div>
-        )}
+                <SelectTrigger className="h-12 w-full rounded-2xl border-[#ddd6c7] bg-[#fcfbf7]">
+                  <SelectValue placeholder="All platforms" />
+                </SelectTrigger>
+                <SelectContent align="start">
+                  <SelectGroup>
+                    <SelectItem value={ALL_PLATFORMS_VALUE}>
+                      All platforms
+                    </SelectItem>
+                    {uniquePlatforms.map((platformOption) => (
+                      <SelectItem key={platformOption} value={platformOption}>
+                        {platformOption}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
 
-        {/* Loading state */}
-        {loading && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-            {Array.from({ length: 5 }).map((_, i) => (
-              <div key={i} className="skeleton" style={{ height: 64 }} />
-            ))}
-          </div>
-        )}
-
-        {/* Empty state */}
-        {!loading && displayedApplications.length === 0 && (
-          <div
-            className="glass-card animate-fade-in"
-            style={{ padding: 60, textAlign: "center" }}
-          >
-            <div style={{ fontSize: 48, marginBottom: 16 }}>📭</div>
-            <h2
-              style={{
-                fontSize: 20,
-                fontWeight: 600,
-                marginBottom: 8,
-              }}
-            >
-              No applications found
-            </h2>
-            <p
-              style={{
-                fontSize: 14,
-                color: "var(--text-secondary)",
-                marginBottom: 24,
-              }}
-            >
-              {filter || search
-                ? "Try adjusting your filters or search."
-                : 'Click "Sync Gmail" to scan your inbox for job-related emails.'}
-            </p>
-            {!filter && !search && (
-              <button
-                onClick={handleSync}
-                disabled={syncing}
-                className="btn-primary"
+              <Select
+                value={currentSortValue}
+                onValueChange={(value) => {
+                  if (!value) return;
+                  const [nextSortBy, nextSortOrder] = value.split(":");
+                  setSortBy(nextSortBy);
+                  setSortOrder(nextSortOrder as "asc" | "desc");
+                }}
               >
-                ⟳ Sync Gmail Now
-              </button>
-            )}
-          </div>
-        )}
-
-        {/* Applications list */}
-        {!loading && displayedApplications.length > 0 && (
-          <div className="glass-card animate-fade-in" style={{ overflow: "hidden" }}>
-            {/* Header row */}
-            <div
-              className="app-row"
-              style={{
-                fontWeight: 600,
-                fontSize: 12,
-                color: "var(--text-muted)",
-                textTransform: "uppercase",
-                letterSpacing: "0.05em",
-                borderBottom: "1px solid var(--border)",
-                background: "rgba(255,255,255,0.02)",
-              }}
-            >
-              <div>Company & Role</div>
-              <div>Platform</div>
-              <div>Date</div>
-              <div>Status</div>
-              <div>Round</div>
+                <SelectTrigger className="h-12 w-full rounded-2xl border-[#ddd6c7] bg-[#fcfbf7]">
+                  <SelectValue placeholder="Sort by" />
+                </SelectTrigger>
+                <SelectContent align="start">
+                  <SelectGroup>
+                    {SORT_OPTIONS.map((option) => (
+                      <SelectItem key={option.value} value={option.value}>
+                        {option.label}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
             </div>
 
-            {displayedApplications.map((app, i) => (
-              <div
-                key={app.id}
-                className="app-row animate-fade-in"
-                style={{ animationDelay: `${i * 30}ms` }}
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => setFilter("")}
+                className={cn(
+                  "inline-flex cursor-pointer items-center rounded-full border px-4 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-900/20",
+                  filter === ""
+                    ? "border-slate-900 bg-slate-900 text-white"
+                    : "border-[#d7d2c3] bg-[#fcfbf7] text-slate-700 hover:bg-[#f8f5ec]"
+                )}
               >
-                {/* Company & Role */}
-                <div>
-                  <div
-                    style={{
-                      fontWeight: 600,
-                      fontSize: 14,
-                      marginBottom: 2,
-                    }}
-                    title={app.company}
-                  >
-                    {app.company}
-                  </div>
-                  <div
-                    style={{
-                      fontSize: 13,
-                      color: "var(--text-secondary)",
-                    }}
-                    title={app.role}
-                  >
-                    {app.role}
-                  </div>
-                  <div
-                    style={{
-                      fontSize: 12,
-                      color: "var(--text-muted)",
-                      marginTop: 4,
-                    }}
-                    title={app.emailSubject}
-                  >
-                    {app.emailSubject || "No subject"}
-                  </div>
-                  {isLowQualityRecord(app) && (
-                    <div style={{ marginTop: 6 }}>
-                      <span className="badge badge-ghosted">Needs Review</span>
-                    </div>
-                  )}
-                </div>
+                All statuses
+              </button>
+              {Object.entries(STATUS_CONFIG).map(([status, config]) => {
+                const Icon = config.icon;
 
-                {/* Platform */}
-                <div>
-                  <span
-                    style={{
-                      fontSize: 13,
-                      color: "var(--text-secondary)",
-                    }}
+                return (
+                  <button
+                    key={status}
+                    type="button"
+                    onClick={() => setFilter(status)}
+                    className={cn(
+                      "inline-flex cursor-pointer items-center gap-2 rounded-full border px-4 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-900/20",
+                      filter === status
+                        ? "border-slate-900 bg-slate-900 text-white"
+                        : "border-[#d7d2c3] bg-[#fcfbf7] text-slate-700 hover:bg-[#f8f5ec]"
+                    )}
                   >
-                    {app.platform || "—"}
-                  </span>
-                </div>
-
-                {/* Date */}
-                <div style={{ fontSize: 13, color: "var(--text-secondary)" }}>
-                  {formatDate(app.dateApplied || app.emailDate)}
-                </div>
-
-                {/* Status */}
-                <div>
-                  {editingId === app.id ? (
-                    <select
-                      className="input-field"
-                      style={{ padding: "6px 10px", fontSize: 12 }}
-                      value={app.status}
-                      onChange={(e) =>
-                        handleStatusChange(app.id, e.target.value)
-                      }
-                      onBlur={() => setEditingId(null)}
-                      autoFocus
-                    >
-                      {Object.entries(STATUS_CONFIG).map(([key, cfg]) => (
-                        <option key={key} value={key}>
-                          {cfg.label}
-                        </option>
-                      ))}
-                    </select>
-                  ) : (
-                    <span
-                      className={`badge badge-${app.status}`}
-                      onClick={() => setEditingId(app.id)}
-                      style={{ cursor: "pointer" }}
-                      title="Click to change status"
-                    >
-                      {STATUS_CONFIG[app.status as keyof typeof STATUS_CONFIG]
-                        ?.icon || "•"}{" "}
-                      {app.status}
-                    </span>
-                  )}
-                </div>
-
-                {/* Round */}
-                <div style={{ fontSize: 13, color: "var(--text-secondary)" }}>
-                  {app.interviewRound || "—"}
-                </div>
-              </div>
-            ))}
+                    <Icon className="size-3.5" />
+                    {config.label}
+                  </button>
+                );
+              })}
+            </div>
           </div>
+        </section>
+
+        {loading ? (
+          <section className="overflow-x-auto pb-3">
+            <div className="grid min-w-max grid-flow-col gap-4">
+              {PIPELINE_COLUMNS.map((column) => (
+                <div
+                  key={column.key}
+                  className="flex w-[290px] flex-col rounded-[28px] border border-[#e7e3d8] bg-[#f3efe4] p-3"
+                >
+                  <div className="rounded-[22px] bg-white/85 p-4">
+                    <Skeleton className="h-5 w-28 rounded-full bg-white" />
+                    <Skeleton className="mt-3 h-4 w-40 rounded-full bg-white" />
+                  </div>
+                  <div className="mt-3 space-y-3">
+                    {Array.from({ length: 3 }).map((_, index) => (
+                      <div
+                        key={index}
+                        className="h-[178px] rounded-[22px] border border-[#e7e3d8] bg-white p-4"
+                      >
+                        <Skeleton className="h-5 w-24 rounded-full" />
+                        <Skeleton className="mt-7 h-12 rounded-2xl" />
+                        <Skeleton className="mt-8 h-4 w-32 rounded-full" />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+        ) : displayedApplications.length === 0 ? (
+          <section className="rounded-[32px] border border-[#e7e3d8] bg-white p-12 text-center">
+            <p className="text-2xl font-semibold tracking-tight text-slate-900">
+              No applications match this view
+            </p>
+            <p className="mx-auto mt-3 max-w-2xl text-sm leading-6 text-[#667085]">
+              {hasActiveFilters
+                ? "Adjust the filters or clear the review queue to widen the results."
+                : "Run a Gmail sync to pull fresh application emails into the board."}
+            </p>
+            <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
+              {hasActiveFilters ? (
+                <Button
+                  variant="outline"
+                  size="lg"
+                  onClick={clearFilters}
+                  className="rounded-full px-4"
+                >
+                  Clear filters
+                </Button>
+              ) : null}
+              <Button
+                onClick={handleSync}
+                disabled={syncing}
+                size="lg"
+                className="rounded-full px-4"
+              >
+                {syncing ? (
+                  <>
+                    <LoaderCircleIcon
+                      data-icon="inline-start"
+                      className="animate-spin"
+                    />
+                    Syncing inbox
+                  </>
+                ) : (
+                  <>
+                    <MailCheckIcon data-icon="inline-start" />
+                    Sync Gmail now
+                  </>
+                )}
+              </Button>
+            </div>
+          </section>
+        ) : (
+          <section className="overflow-x-auto pb-3">
+            <div className="grid min-w-max grid-flow-col gap-4">
+              {pipelineColumns.map((column) => (
+                <PipelineColumn
+                  key={column.key}
+                  column={column}
+                  applications={column.applications}
+                />
+              ))}
+            </div>
+          </section>
         )}
 
-        {/* Footer */}
-        <footer
-          style={{
-            textAlign: "center",
-            padding: "32px 0",
-            fontSize: 12,
-            color: "var(--text-muted)",
-          }}
-        >
-          Powered by Gemini AI · Made for job seekers ❤️
+        <footer className="flex flex-wrap items-center justify-between gap-3 rounded-[28px] border border-[#e7e3d8] bg-white px-5 py-4 text-sm text-[#667085]">
+          <div className="flex items-center gap-2">
+            <BriefcaseBusinessIcon className="size-4" />
+            Built to manage real application volume, not just a demo table.
+          </div>
+          <div className="flex items-center gap-2">
+            <CalendarDaysIcon className="size-4" />
+            {data?.lastSyncAt
+              ? `Last inbox refresh ${formatDate(data.lastSyncAt)}`
+              : "Waiting for your first inbox sync"}
+          </div>
         </footer>
       </main>
     </div>

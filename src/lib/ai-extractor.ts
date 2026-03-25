@@ -1,22 +1,71 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import type { GmailMessage } from "@/lib/gmail";
+import { buildEmailTextContext } from "@/lib/gmail";
 
 export interface ExtractedJobData {
   isJobRelated: boolean;
   company: string;
-  role: string;
+  role: string | null;
   dateApplied: string | null;
   status: "applied" | "interviewing" | "offered" | "rejected" | "ghosted";
   interviewRound: string | null;
   platform: string | null;
 }
 
+export interface JobExtractionDiagnostics {
+  aiUsed: boolean;
+  aiSucceeded: boolean;
+  companySource: string;
+  roleSource: string | null;
+  ambiguousRole: boolean;
+  roleCandidates: Array<{
+    value: string;
+    source: string;
+    priority: number;
+  }>;
+  rejectedRoleCandidates: string[];
+  normalizedContextLength: number;
+}
+
+export interface JobExtractionResult {
+  extracted: ExtractedJobData;
+  diagnostics: JobExtractionDiagnostics;
+}
+
 type GeminiModel = ReturnType<GoogleGenerativeAI["getGenerativeModel"]>;
+
+interface SubjectHints {
+  company: string | null;
+  role: string | null;
+}
+
+interface RoleCandidate {
+  value: string;
+  source: string;
+  priority: number;
+}
+
+interface ResolvedRole {
+  role: string | null;
+  source: string | null;
+  candidates: RoleCandidate[];
+  rejectedCandidates: string[];
+  ambiguous: boolean;
+}
+
+interface InferredCompany {
+  company: string;
+  source: string;
+}
 
 const MODEL_NAME = "gemini-2.0-flash";
 const AI_TIMEOUT_MS = 8000;
+const GEMINI_QUOTA_COOLDOWN_MS = 60_000;
 
 let cachedApiKey: string | null = null;
 let cachedModel: GeminiModel | null = null;
+let geminiQuotaCooldownUntil = 0;
+let lastGeminiQuotaWarningAt = 0;
 
 const VALID_STATUSES: ExtractedJobData["status"][] = [
   "applied",
@@ -96,6 +145,9 @@ const TRANSACTIONAL_JOB_PATTERNS = [
   "your candidacy",
   "move forward",
   "application status",
+  "job number",
+  "req id",
+  "requisition id",
 ];
 
 const RECIPIENT_SPECIFIC_PATTERNS = [
@@ -119,6 +171,7 @@ const RECIPIENT_SPECIFIC_PATTERNS = [
   "pleased to offer",
   "regret to inform",
   "not moving forward",
+  "job number",
 ];
 
 const COMPANY_STOP_PHRASES = [
@@ -158,12 +211,72 @@ const ROLE_STOP_PHRASES = [
   "candidate home",
   "click here",
   "view your profile",
+  "action center",
+  "job number",
+  "req id",
+  "requisition id",
+  "check back frequently",
+  "career at",
 ];
 
-interface SubjectHints {
-  company: string | null;
-  role: string | null;
-}
+const GENERIC_ROLE_TOKENS = new Set([
+  "application",
+  "interview",
+  "assessment",
+  "candidate",
+  "offer",
+  "job",
+  "position",
+  "role",
+  "update",
+  "thank you",
+  "application status",
+  "candidate portal",
+  "candidate home",
+]);
+
+const ROLE_PATTERNS: Array<{
+  regex: RegExp;
+  source: string;
+  priority: number;
+}> = [
+  {
+    regex:
+      /submit(?:ting|ted)?(?: the time)? to submit your application for\s+([A-Za-z0-9/&,+.()\- ]{3,120}?)(?=\s*\((?:job|req|requisition)|[.!?\n,]| at\b| with\b)/gi,
+    source: "body-submit-application-for",
+    priority: 100,
+  },
+  {
+    regex:
+      /(?:received|reviewing|process(?:ing)?)\s+(?:your\s+)?application\s+for\s+([A-Za-z0-9/&,+.()\- ]{3,120}?)(?=\s*\((?:job|req|requisition)|[.!?\n,]| at\b| with\b)/gi,
+    source: "body-application-for",
+    priority: 100,
+  },
+  {
+    regex:
+      /([A-Za-z0-9/&,+.()\- ]{3,120}?)\s*\((?:job|req|requisition)\s*(?:number|id)?[:#]?\s*[A-Za-z0-9-]+\)/gi,
+    source: "body-role-with-job-id",
+    priority: 98,
+  },
+  {
+    regex:
+      /(?:role|position|job title|title)\s*[:\-]\s*([A-Za-z0-9/&,+.()\- ]{3,120})/gi,
+    source: "body-role-label",
+    priority: 94,
+  },
+  {
+    regex:
+      /(?:you applied for|applied for(?: the)?|application for|for the)\s+([A-Za-z0-9/&,+.()\- ]{3,120}?)(?=\s*(?:role|position|job|\(|[.!?\n,]| at\b| with\b))/gi,
+    source: "body-applied-for",
+    priority: 90,
+  },
+  {
+    regex:
+      /^([A-Za-z0-9/&,+.()\- ]{3,80})\s+at\s+([A-Za-z0-9&.,'()\-/ ]{2,80})$/i,
+    source: "subject-role-at-company",
+    priority: 72,
+  },
+];
 
 const PUBLIC_MAIL_PROVIDERS = new Set([
   "gmail.com",
@@ -176,29 +289,38 @@ const PUBLIC_MAIL_PROVIDERS = new Set([
   "aol.com",
 ]);
 
-const EXTRACTION_PROMPT = `You are a job application data extractor. Given email sender, subject, and body, extract structured data about a specific job application.
+const EXTRACTION_PROMPT = `You extract structured job-application data from email messages.
 
 Return ONLY a valid JSON object with these fields:
 {
   "isJobRelated": boolean,
-  "company": "Company Name (the hiring company, NOT the job platform)",
-  "role": "Job Title / Position",
-  "dateApplied": "YYYY-MM-DD or null if unknown",
+  "company": "Hiring company name",
+  "role": "Exact applied role title from the email body or null",
+  "dateApplied": "YYYY-MM-DD or null",
   "status": "applied | interviewing | offered | rejected | ghosted",
   "interviewRound": "Phone Screen | Online Assessment | Round 1 | Round 2 | Final Round | HR Round | null",
-  "platform": "LinkedIn | Naukri | Indeed | Glassdoor | Wellfound | Career Site | Direct | Other"
+  "platform": "LinkedIn | Naukri | Indeed | Glassdoor | Wellfound | Career Site | Direct | Other | null"
 }
 
 Rules:
-- If the email is NOT about a specific job application (e.g., it's a promotion, newsletter, or general alert), set isJobRelated to false and fill other fields with defaults.
-- Do NOT treat livestreams, creator content, webinars, newsletters, interview-prep content, or general career content as job-related unless they clearly reference the recipient's specific application or candidacy.
-- Extract the company that is HIRING, not the job platform (e.g., "Google" not "LinkedIn").
-- If company is not explicit, infer from sender display name and sender domain when possible.
-- Infer status from context: "received your application" → applied, "interview scheduled" → interviewing, "pleased to offer" → offered, "unfortunately"/"regret" → rejected.
-- Return ONLY the JSON object, no explanation, no code fences.`;
+- Use the FULL email body, not just the subject.
+- Extract the exact applied role title only when the email explicitly states it.
+- If multiple different role titles appear and none is clearly the applied role, return role as null.
+- Do not return workflow phrases, candidate-portal text, or generic words like "application" as the role.
+- The company must be the hiring company, not the job platform.
+- Mark newsletters, alerts, digests, or generic career content as isJobRelated=false.
+- Return JSON only.`;
 
-function normalizeText(subject: string, body: string): string {
-  return `${subject} ${body.slice(0, 1500)}`.toLowerCase();
+function normalizeWhitespace(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function textIncludesAny(text: string, patterns: string[]): boolean {
+  return patterns.some((pattern) => text.includes(pattern));
 }
 
 function parseExtractionResponse(responseText: string): ExtractedJobData | null {
@@ -214,17 +336,12 @@ function parseExtractionResponse(responseText: string): ExtractedJobData | null 
     const last = cleaned.lastIndexOf("}");
     if (first === -1 || last <= first) return null;
 
-    const candidate = cleaned.slice(first, last + 1);
     try {
-      return JSON.parse(candidate) as ExtractedJobData;
+      return JSON.parse(cleaned.slice(first, last + 1)) as ExtractedJobData;
     } catch {
       return null;
     }
   }
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function trimAtStopPhrase(value: string, stopPhrases: string[]): string {
@@ -232,119 +349,96 @@ function trimAtStopPhrase(value: string, stopPhrases: string[]): string {
   let cutIndex = -1;
 
   for (const phrase of stopPhrases) {
-    const idx = lower.indexOf(phrase);
-    if (idx > 0 && (cutIndex === -1 || idx < cutIndex)) {
-      cutIndex = idx;
+    const index = lower.indexOf(phrase);
+    if (index > 0 && (cutIndex === -1 || index < cutIndex)) {
+      cutIndex = index;
     }
   }
 
   return cutIndex > 0 ? value.slice(0, cutIndex).trim() : value.trim();
 }
 
-function isGenericRoleToken(value: string): boolean {
-  const normalized = value.trim().toLowerCase();
-  return [
-    "application",
-    "interview",
-    "assessment",
-    "candidate",
-    "offer",
-    "job",
-    "position",
-    "role",
-  ].includes(normalized);
-}
-
 function cleanCompanyName(value: string | null | undefined): string | null {
   if (!value) return null;
-  let cleaned = value.replace(/["'`]/g, "").replace(/\s+/g, " ").trim();
 
+  let cleaned = normalizeWhitespace(value.replace(/["'`]/g, ""));
   cleaned = cleaned.replace(
     /^(thank you for applying to|thank you for your application to|application received(?: for)?|your application (?:to|for)|we(?:'|’)ve? received your application (?:for|to)?|applying to)\s+/i,
-    ""
+    "",
   );
 
   cleaned = trimAtStopPhrase(cleaned, COMPANY_STOP_PHRASES);
-
-  const splitBySeparator = cleaned.split(/\s(?:-|:)\s/);
-  if (splitBySeparator.length > 1) {
-    const suffix = splitBySeparator.slice(1).join(" ").toLowerCase();
-    if (COMPANY_STOP_PHRASES.some((phrase) => suffix.includes(phrase))) {
-      cleaned = splitBySeparator[0].trim();
-    }
-  }
-
-  if (cleaned.length > 85) {
-    cleaned = cleaned.split(/[.!?]/)[0]?.trim() || cleaned;
-  }
-
   cleaned = cleaned.replace(/[.,:;\-|]+$/g, "").trim();
   cleaned = cleaned
     .replace(
       /\b(careers?|recruiting|talent|talent acquisition|jobs?|team|hiring team|recruitment)\b$/i,
-      ""
+      "",
     )
     .trim();
 
-  cleaned = cleaned.replace(/^[-:|,\s]+|[-:|,\s]+$/g, "").trim();
-  if (!cleaned) return null;
-  return cleaned;
+  return cleaned || null;
 }
 
-function cleanRoleName(
+function isGenericRoleToken(value: string): boolean {
+  return GENERIC_ROLE_TOKENS.has(value.trim().toLowerCase());
+}
+
+function cleanRoleCandidate(
   value: string | null | undefined,
-  company?: string | null
+  company?: string | null,
 ): string | null {
   if (!value) return null;
-  let cleaned = value.replace(/["'`]/g, "").replace(/\s+/g, " ").trim();
 
+  let cleaned = normalizeWhitespace(value.replace(/["'`]/g, ""));
   cleaned = cleaned.replace(
-    /^(thank you for applying to|thank you for your application to|we(?:'|’)ve? received your application(?: for| to)?|application received(?: for)?|application update|application confirmation|application submitted|your application (?:to|for)|invitation to complete (?:an|a))\s+/i,
-    ""
+    /^(thank you for applying(?: to)?|thank you for your application(?: to)?|application received(?: for)?|application update|application confirmation|application submitted|we(?:'|’)ve? received your application(?: for| to)?|your application (?:to|for)|you applied for(?: the)?|applied for(?: the)?|submit(?:ting|ted)?(?: the time)? to submit your application for)\s+/i,
+    "",
   );
 
-  cleaned = trimAtStopPhrase(cleaned, ROLE_STOP_PHRASES);
+  cleaned = cleaned.replace(
+    /\s*\((?:job|req|requisition)\s*(?:number|id)?[:#]?\s*[A-Za-z0-9-]+\)\s*$/i,
+    "",
+  );
+  cleaned = cleaned.replace(
+    /\b(?:job|req|requisition)\s*(?:number|id)?[:#]?\s*[A-Za-z0-9-]+\b/gi,
+    "",
+  );
 
   if (company) {
-    const escapedCompany = escapeRegExp(company.trim());
-    const companyRegex = new RegExp(`\\b${escapedCompany}\\b`, "ig");
-    cleaned = cleaned.replace(companyRegex, " ").replace(/\s+/g, " ").trim();
+    cleaned = cleaned
+      .replace(new RegExp(`\\bat\\s+${escapeRegExp(company)}\\b`, "ig"), " ")
+      .replace(new RegExp(`\\b${escapeRegExp(company)}\\b`, "ig"), " ");
   }
 
+  cleaned = trimAtStopPhrase(cleaned, ROLE_STOP_PHRASES);
   cleaned = cleaned.replace(/^[-:|,\s]+|[-:|,\s]+$/g, "").trim();
+  cleaned = normalizeWhitespace(cleaned);
 
-  if (!cleaned || cleaned.length < 3) return null;
-  if (cleaned.length > 90) return null;
+  if (!cleaned || cleaned.length < 3 || cleaned.length > 90) return null;
   if (isGenericRoleToken(cleaned)) return null;
 
   const words = cleaned.split(" ").filter(Boolean);
-  if (words.length > 12 && ROLE_STOP_PHRASES.some((phrase) => cleaned.toLowerCase().includes(phrase))) {
-    return null;
-  }
+  if (words.length > 12) return null;
 
   return cleaned;
 }
 
-function extractSubjectHints(subject: string): SubjectHints {
-  const normalized = subject.replace(/\s+/g, " ").trim();
-  if (!normalized) {
-    return { company: null, role: null };
-  }
+function normalizeRoleKey(value: string): string {
+  return value.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "").replace(/\s+/g, " ").trim();
+}
 
-  const subjectPatterns: Array<{
+function extractSubjectHints(subject: string): SubjectHints {
+  const normalized = normalizeWhitespace(subject);
+  if (!normalized) return { company: null, role: null };
+
+  const patterns: Array<{
     regex: RegExp;
     companyIndex?: number;
     roleIndex?: number;
   }> = [
     {
       regex:
-        /^([A-Za-z0-9&.,'()\-/ ]{2,80})\s*[:|]\s*(?:application received|application update|application confirmation|we(?:'|’)ve? received your application|thank you for applying(?: to)?|interview invitation|interview scheduled|offer letter|online assessment|invitation to [^:|]{2,60})(?:\s*[-:|]\s*([A-Za-z0-9/&,+.()\- ]{2,80}))?$/i,
-      companyIndex: 1,
-      roleIndex: 2,
-    },
-    {
-      regex:
-        /^([A-Za-z0-9&.,'()\-/ ]{2,80})\s+-\s+(?:application received|application update|we(?:'|’)ve? received your application|thank you for applying(?: to)?)(?:\s+([A-Za-z0-9/&,+.()\- ]{2,80}))?$/i,
+        /^([A-Za-z0-9&.,'()\-/ ]{2,80})\s*[:|]\s*(?:application received|application update|application confirmation|we(?:'|’)ve? received your application|thank you for applying(?: to)?|interview invitation|interview scheduled|offer letter)(?:\s*[-:|]\s*([A-Za-z0-9/&,+.()\- ]{2,80}))?$/i,
       companyIndex: 1,
       roleIndex: 2,
     },
@@ -368,16 +462,16 @@ function extractSubjectHints(subject: string): SubjectHints {
     },
   ];
 
-  for (const pattern of subjectPatterns) {
+  for (const pattern of patterns) {
     const match = normalized.match(pattern.regex);
     if (!match) continue;
 
     const company = cleanCompanyName(
-      pattern.companyIndex ? match[pattern.companyIndex] : null
+      pattern.companyIndex ? match[pattern.companyIndex] : null,
     );
-    const role = cleanRoleName(
+    const role = cleanRoleCandidate(
       pattern.roleIndex ? match[pattern.roleIndex] : null,
-      company
+      company,
     );
 
     if (company || role) {
@@ -391,26 +485,21 @@ function extractSubjectHints(subject: string): SubjectHints {
 function isUnknownCompany(value: string | null | undefined): boolean {
   const cleaned = cleanCompanyName(value)?.toLowerCase();
   if (!cleaned) return true;
-  if (
-    cleaned === "unknown" ||
-    cleaned === "unknown company" ||
-    cleaned === "n/a" ||
-    cleaned === "na" ||
-    cleaned === "none" ||
-    cleaned === "null"
-  ) {
+
+  if (["unknown", "unknown company", "n/a", "na", "none", "null"].includes(cleaned)) {
     return true;
   }
+
   return KNOWN_PLATFORM_NAMES.some((platform) => cleaned.includes(platform));
 }
 
 function extractEmailAddress(from: string): string {
-  const fromTrimmed = from.trim();
-  const angleMatch = fromTrimmed.match(/<([^>]+)>/);
+  const angleMatch = from.match(/<([^>]+)>/);
   if (angleMatch?.[1]) return angleMatch[1].toLowerCase();
 
-  const plainMatch = fromTrimmed.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
-  return plainMatch?.[0].toLowerCase() || "";
+  return (
+    from.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0].toLowerCase() || ""
+  );
 }
 
 function extractSenderDisplayName(from: string): string | null {
@@ -418,7 +507,6 @@ function extractSenderDisplayName(from: string): string | null {
   if (!trimmed) return null;
   const angleIndex = trimmed.indexOf("<");
   const rawName = angleIndex > 0 ? trimmed.slice(0, angleIndex).trim() : "";
-  if (!rawName) return null;
   return cleanCompanyName(rawName.replace(/^"|"$/g, ""));
 }
 
@@ -431,15 +519,12 @@ function extractCompanyFromDomain(from: string): string | null {
   if (parts.length < 2) return null;
 
   let index = parts.length - 2;
-  if (
-    ["co", "com", "org", "net"].includes(parts[index]) &&
-    parts.length >= 3
-  ) {
+  if (["co", "com", "org", "net"].includes(parts[index]) && parts.length >= 3) {
     index = parts.length - 3;
   }
 
   const token = parts[index];
-  if (!token || KNOWN_PLATFORM_NAMES.some((p) => token.includes(p))) {
+  if (!token || KNOWN_PLATFORM_NAMES.some((platform) => token.includes(platform))) {
     return null;
   }
 
@@ -452,18 +537,16 @@ function extractCompanyFromDomain(from: string): string | null {
   return cleanCompanyName(normalized);
 }
 
-function extractCompanyFromText(subject: string, body: string): string | null {
-  const source = `${subject}\n${body.slice(0, 2500)}`;
+function extractCompanyFromText(text: string): string | null {
   const patterns = [
     /thank you for applying to\s+([A-Za-z0-9&.,'\- ]{2,80})/i,
     /your application to\s+([A-Za-z0-9&.,'\- ]{2,80})/i,
     /(?:interview|offer|application)\s+(?:with|at|from)\s+([A-Za-z0-9&.,'\- ]{2,80})/i,
     /position\s+(?:at|with)\s+([A-Za-z0-9&.,'\- ]{2,80})/i,
-    /welcome to\s+([A-Za-z0-9&.,'\- ]{2,80})/i,
   ];
 
   for (const pattern of patterns) {
-    const match = source.match(pattern);
+    const match = text.match(pattern);
     if (!match?.[1]) continue;
     const cleaned = cleanCompanyName(match[1]);
     if (!isUnknownCompany(cleaned)) {
@@ -474,120 +557,204 @@ function extractCompanyFromText(subject: string, body: string): string | null {
   return null;
 }
 
-function extractRoleFromText(
-  subject: string,
-  body: string,
-  company: string | null
-): string | null {
-  const source = `${subject}\n${body.slice(0, 2500)}`;
-  const patterns = [
-    /application received\s*[:\-]?\s*([A-Za-z0-9/&,+.()\- ]{2,80})$/i,
-    /(?:for|role|position|job title)\s*[:\-]?\s*([A-Za-z0-9/&,+.()\- ]{2,80})/i,
-    /appl(?:ied|ying) for(?: the)?\s+([A-Za-z0-9/&,+.()\- ]{2,80})/i,
-    /for the\s+([A-Za-z0-9/&,+.()\- ]{2,80})\s+(?:role|position)/i,
-  ];
+function collectRoleCandidates(
+  email: GmailMessage,
+  company: string | null,
+  aiRole: string | null | undefined,
+  subjectHints: SubjectHints,
+): RoleCandidate[] {
+  const candidates: RoleCandidate[] = [];
+  const bodyText = email.textBody.slice(0, 12_000);
 
-  for (const pattern of patterns) {
-    const match = source.match(pattern);
-    if (!match?.[1]) continue;
+  for (const pattern of ROLE_PATTERNS) {
+    if (pattern.source === "subject-role-at-company") {
+      const match = email.subject.match(pattern.regex);
+      if (match?.[1]) {
+        const cleaned = cleanRoleCandidate(match[1], company);
+        if (cleaned) {
+          candidates.push({
+            value: cleaned,
+            source: pattern.source,
+            priority: pattern.priority,
+          });
+        }
+      }
 
-    const cleaned = cleanRoleName(match[1], company);
-    if (!cleaned) continue;
-
-    if (company && cleaned.toLowerCase() === company.toLowerCase()) {
       continue;
     }
 
-    return cleaned;
+    for (const match of bodyText.matchAll(pattern.regex)) {
+      const cleaned = cleanRoleCandidate(match[1], company);
+      if (cleaned) {
+        candidates.push({
+          value: cleaned,
+          source: pattern.source,
+          priority: pattern.priority,
+        });
+      }
+    }
   }
 
-  return null;
+  if (subjectHints.role) {
+    candidates.push({
+      value: subjectHints.role,
+      source: "subject-hint",
+      priority: 74,
+    });
+  }
+
+  const cleanedAiRole = cleanRoleCandidate(aiRole, company);
+  if (cleanedAiRole) {
+    candidates.push({
+      value: cleanedAiRole,
+      source: "ai",
+      priority: 68,
+    });
+  }
+
+  return candidates;
 }
 
-function looksLikeRoleLabel(value: string): boolean {
-  const normalized = value.trim();
-  if (!normalized) return false;
+function resolveRole(
+  email: GmailMessage,
+  company: string | null,
+  aiRole: string | null | undefined,
+  subjectHints: SubjectHints,
+): ResolvedRole {
+  const candidates = collectRoleCandidates(email, company, aiRole, subjectHints);
 
-  const lower = normalized.toLowerCase();
-  if (ROLE_STOP_PHRASES.some((phrase) => lower.includes(phrase))) {
-    return false;
+  const grouped = new Map<
+    string,
+    {
+      value: string;
+      bestPriority: number;
+      sources: string[];
+    }
+  >();
+
+  for (const candidate of candidates) {
+    const key = normalizeRoleKey(candidate.value);
+    const existing = grouped.get(key);
+
+    if (!existing) {
+      grouped.set(key, {
+        value: candidate.value,
+        bestPriority: candidate.priority,
+        sources: [candidate.source],
+      });
+      continue;
+    }
+
+    existing.bestPriority = Math.max(existing.bestPriority, candidate.priority);
+    if (!existing.sources.includes(candidate.source)) {
+      existing.sources.push(candidate.source);
+    }
   }
 
-  const wordCount = normalized.split(/\s+/).filter(Boolean).length;
-  return wordCount <= 8;
+  const rankedGroups = Array.from(grouped.values()).sort(
+    (left, right) => right.bestPriority - left.bestPriority,
+  );
+
+  const strongGroups = rankedGroups.filter((group) => group.bestPriority >= 90);
+  if (strongGroups.length > 1) {
+    return {
+      role: null,
+      source: null,
+      candidates,
+      rejectedCandidates: rankedGroups.map((group) => group.value),
+      ambiguous: true,
+    };
+  }
+
+  if (strongGroups.length === 1) {
+    const chosen = strongGroups[0];
+    return {
+      role: chosen.value,
+      source: chosen.sources[0] || "body-pattern",
+      candidates,
+      rejectedCandidates: rankedGroups
+        .filter((group) => group.value !== chosen.value)
+        .map((group) => group.value),
+      ambiguous: false,
+    };
+  }
+
+  if (rankedGroups.length === 1) {
+    const chosen = rankedGroups[0];
+    return {
+      role: chosen.value,
+      source: chosen.sources[0] || null,
+      candidates,
+      rejectedCandidates: [],
+      ambiguous: false,
+    };
+  }
+
+  if (rankedGroups.length > 1) {
+    return {
+      role: null,
+      source: null,
+      candidates,
+      rejectedCandidates: rankedGroups.map((group) => group.value),
+      ambiguous: true,
+    };
+  }
+
+  return {
+    role: null,
+    source: null,
+    candidates,
+    rejectedCandidates: [],
+    ambiguous: false,
+  };
 }
 
 function inferCompany(
   aiCompany: string | null | undefined,
-  subject: string,
-  body: string,
-  from: string,
-  subjectHints: SubjectHints
-): string {
+  email: GmailMessage,
+  subjectHints: SubjectHints,
+): InferredCompany {
   const cleanedAi = cleanCompanyName(aiCompany);
   if (!isUnknownCompany(cleanedAi)) {
-    return cleanedAi!;
+    return { company: cleanedAi!, source: "ai" };
   }
 
   if (!isUnknownCompany(subjectHints.company)) {
-    return subjectHints.company!;
+    return { company: subjectHints.company!, source: "subject-hint" };
   }
 
-  const fromText = extractCompanyFromText(subject, body);
-  if (fromText) return fromText;
-
-  const displayName = extractSenderDisplayName(from);
-  if (!isUnknownCompany(displayName)) {
-    return displayName!;
-  }
-
-  const fromDomain = extractCompanyFromDomain(from);
-  if (!isUnknownCompany(fromDomain)) {
-    return fromDomain!;
-  }
-
-  return "Unknown Company";
-}
-
-function inferRole(
-  subject: string,
-  body: string,
-  aiRole: string | null | undefined,
-  company: string,
-  subjectHints: SubjectHints
-): string {
-  const cleanedAiRole = cleanRoleName(aiRole, company);
-  if (cleanedAiRole) {
-    return cleanedAiRole;
-  }
-
-  if (subjectHints.role) {
-    return subjectHints.role;
-  }
-
-  const fromText = extractRoleFromText(subject, body, company);
+  const textContext = buildEmailTextContext(email, 12_000);
+  const fromText = extractCompanyFromText(textContext);
   if (fromText) {
-    return fromText;
+    return { company: fromText, source: "body-pattern" };
   }
 
-  const roleMatch = subject.match(
-    /(?:for|role|position)\s+(?:the\s+)?([A-Za-z0-9/,+&.\- ]{3,80})(?:\s+at|\s+with|$)/i
-  );
-  const fromSubjectPattern = cleanRoleName(roleMatch?.[1], company);
-  if (fromSubjectPattern) {
-    return fromSubjectPattern;
+  const displayName = extractSenderDisplayName(email.from);
+  if (!isUnknownCompany(displayName)) {
+    return { company: displayName!, source: "sender-display-name" };
   }
 
-  const cleanedSubject = cleanRoleName(subject, company);
-  if (cleanedSubject && looksLikeRoleLabel(cleanedSubject)) {
-    return cleanedSubject;
+  const domain = extractCompanyFromDomain(email.from);
+  if (!isUnknownCompany(domain)) {
+    return { company: domain!, source: "sender-domain" };
   }
 
-  return "Unknown Role";
+  return { company: "Unknown Company", source: "unknown" };
 }
 
-function inferStatus(subject: string, body: string): ExtractedJobData["status"] {
-  const text = normalizeText(subject, body);
+function inferInterviewRound(text: string): string | null {
+  if (/phone screen|recruiter call|intro call/i.test(text)) return "Phone Screen";
+  if (/online assessment|coding challenge|hackerrank|codesignal|codility/i.test(text)) {
+    return "Online Assessment";
+  }
+  if (/final round|panel interview|onsite/i.test(text)) return "Final Round";
+  if (/round 2|second round/i.test(text)) return "Round 2";
+  if (/round 1|first round/i.test(text)) return "Round 1";
+  if (/hr round/i.test(text)) return "HR Round";
+  return null;
+}
+
+function inferStatus(text: string): ExtractedJobData["status"] {
   if (
     text.includes("pleased to offer") ||
     text.includes("offer letter") ||
@@ -595,6 +762,7 @@ function inferStatus(subject: string, body: string): ExtractedJobData["status"] 
   ) {
     return "offered";
   }
+
   if (
     text.includes("regret to inform") ||
     text.includes("unfortunately") ||
@@ -603,6 +771,7 @@ function inferStatus(subject: string, body: string): ExtractedJobData["status"] 
   ) {
     return "rejected";
   }
+
   if (
     text.includes("interview") ||
     text.includes("assessment") ||
@@ -610,51 +779,34 @@ function inferStatus(subject: string, body: string): ExtractedJobData["status"] 
   ) {
     return "interviewing";
   }
+
   return "applied";
-}
-
-function isPromotionalEmail(subject: string, body: string): boolean {
-  const text = normalizeText(subject, body);
-  return PROMOTIONAL_PATTERNS.some((pattern) => text.includes(pattern));
-}
-
-function hasTransactionalJobSignal(subject: string, body: string): boolean {
-  const text = normalizeText(subject, body);
-  return TRANSACTIONAL_JOB_PATTERNS.some((pattern) => text.includes(pattern));
-}
-
-function hasRecipientSpecificSignal(subject: string, body: string): boolean {
-  const text = normalizeText(subject, body);
-  return RECIPIENT_SPECIFIC_PATTERNS.some((pattern) =>
-    text.includes(pattern)
-  );
 }
 
 function normalizeDateApplied(value: string | null | undefined): string | null {
   if (!value) return null;
   const trimmed = value.trim();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return null;
-  return trimmed;
+  return /^\d{4}-\d{2}-\d{2}$/.test(trimmed) ? trimmed : null;
 }
 
-function isUnknownRole(value: string | null | undefined): boolean {
-  if (!value) return true;
-  const normalized = value.trim().toLowerCase();
-  return (
-    normalized.length === 0 ||
-    normalized === "unknown" ||
-    normalized === "unknown role" ||
-    normalized === "n/a" ||
-    normalized === "none"
-  );
+function isPromotionalEmail(text: string): boolean {
+  return textIncludesAny(text, PROMOTIONAL_PATTERNS);
+}
+
+function hasTransactionalJobSignal(text: string): boolean {
+  return textIncludesAny(text, TRANSACTIONAL_JOB_PATTERNS);
+}
+
+function hasRecipientSpecificSignal(text: string): boolean {
+  return textIncludesAny(text, RECIPIENT_SPECIFIC_PATTERNS);
 }
 
 function isMeaningfulCompany(value: string): boolean {
   return !isUnknownCompany(value);
 }
 
-function isMeaningfulRole(value: string): boolean {
-  return !isUnknownRole(value);
+function isMeaningfulRole(value: string | null): boolean {
+  return Boolean(value && !isGenericRoleToken(value));
 }
 
 function getGenerativeModel(apiKey: string): GeminiModel {
@@ -670,7 +822,7 @@ function getGenerativeModel(apiKey: string): GeminiModel {
 async function withTimeout<T>(
   promise: Promise<T>,
   timeoutMs: number,
-  timeoutMessage: string
+  timeoutMessage: string,
 ): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -687,110 +839,155 @@ async function withTimeout<T>(
   }
 }
 
-function buildDeterministicExtraction(
-  subject: string,
-  body: string,
-  senderPlatform: string | null,
-  from: string
-): ExtractedJobData | null {
-  const promotional = isPromotionalEmail(subject, body);
-  const transactional = hasTransactionalJobSignal(subject, body);
-  const recipientSpecific = hasRecipientSpecificSignal(subject, body);
-  const subjectHints = extractSubjectHints(subject);
-
-  const company = inferCompany(null, subject, body, from, subjectHints);
-  const role = inferRole(subject, body, null, company, subjectHints);
-  const status = inferStatus(subject, body);
-
-  if (promotional && !transactional) {
-    return {
-      isJobRelated: false,
-      company: "Unknown Company",
-      role: "Unknown Role",
-      dateApplied: null,
-      status,
-      interviewRound: null,
-      platform: senderPlatform,
-    };
-  }
-
-  if (
-    transactional &&
-    recipientSpecific &&
-    (isMeaningfulCompany(company) || isMeaningfulRole(role))
-  ) {
-    return {
-      isJobRelated: true,
-      company,
-      role,
-      dateApplied: null,
-      status,
-      interviewRound: null,
-      platform: senderPlatform,
-    };
-  }
-
-  return null;
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return String(error);
 }
 
-function buildHeuristicFallback(
-  subject: string,
-  body: string,
-  senderPlatform: string | null,
-  from: string
-): ExtractedJobData {
-  const transactional = hasTransactionalJobSignal(subject, body);
-  const promotional = isPromotionalEmail(subject, body);
-  const recipientSpecific = hasRecipientSpecificSignal(subject, body);
-  const isJobRelated = transactional && recipientSpecific && !promotional;
-  const subjectHints = extractSubjectHints(subject);
-  const company = inferCompany(
-    null,
-    subject,
-    body,
-    from,
-    subjectHints
+function isGeminiQuotaError(error: unknown): boolean {
+  const message = getErrorMessage(error).toLowerCase();
+  return (
+    message.includes("429") ||
+    message.includes("too many requests") ||
+    message.includes("quota exceeded") ||
+    message.includes("rate limit")
   );
-  const role = inferRole(subject, body, null, company, subjectHints);
+}
+
+function getGeminiRetryDelayMs(error: unknown): number {
+  const message = getErrorMessage(error);
+  const retryInfoMatch = message.match(/retry in\s+(\d+(?:\.\d+)?)s/i);
+  if (retryInfoMatch?.[1]) {
+    return Math.max(Math.ceil(Number.parseFloat(retryInfoMatch[1]) * 1000), 1000);
+  }
+
+  const retryDelayMatch = message.match(/"retryDelay":"(\d+)s"/i);
+  if (retryDelayMatch?.[1]) {
+    return Math.max(Number.parseInt(retryDelayMatch[1], 10) * 1000, 1000);
+  }
+
+  return GEMINI_QUOTA_COOLDOWN_MS;
+}
+
+function buildAiFallbackResult(
+  deterministic: JobExtractionResult,
+): JobExtractionResult {
+  return {
+    ...deterministic,
+    diagnostics: {
+      ...deterministic.diagnostics,
+      aiUsed: true,
+      aiSucceeded: false,
+    },
+  };
+}
+
+function warnGeminiQuotaOnce(retryMs: number) {
+  const now = Date.now();
+  if (now - lastGeminiQuotaWarningAt < GEMINI_QUOTA_COOLDOWN_MS) {
+    return;
+  }
+
+  lastGeminiQuotaWarningAt = now;
+  console.warn(
+    `Gemini quota exceeded; using deterministic extraction for ${Math.ceil(
+      retryMs / 1000,
+    )}s.`,
+  );
+}
+
+function buildModelEmailContext(
+  email: GmailMessage,
+  senderPlatform: string | null,
+): { content: string; contextLength: number } {
+  const normalizedText = buildEmailTextContext(email, 12_000);
+  const htmlPreview = email.htmlBody.slice(0, 4_000);
+  const links = email.links
+    .slice(0, 12)
+    .map((link) => `- ${link.text || "(no label)"} -> ${link.href}`)
+    .join("\n");
+  const images = email.images
+    .slice(0, 8)
+    .map((image) =>
+      `- alt=${image.alt || "none"} filename=${image.filename || "none"} src=${image.sourceUrl || "inline"} cid=${image.contentId || "none"}`,
+    )
+    .join("\n");
 
   return {
-    isJobRelated,
-    company: isJobRelated ? company : "Unknown Company",
-    role: isJobRelated ? role : "Unknown Role",
-    dateApplied: null,
-    status: inferStatus(subject, body),
-    interviewRound: null,
-    platform: senderPlatform,
+    contextLength: normalizedText.length,
+    content: [
+      `From: ${email.from}`,
+      `Detected Platform: ${senderPlatform || "none"}`,
+      `Subject: ${email.subject}`,
+      `Text Context:\n${normalizedText}`,
+      htmlPreview ? `HTML Preview:\n${htmlPreview}` : "",
+      links ? `Links:\n${links}` : "",
+      images ? `Image Hints:\n${images}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n\n"),
+  };
+}
+
+function buildDeterministicResult(
+  email: GmailMessage,
+  senderPlatform: string | null,
+): JobExtractionResult {
+  const subjectHints = extractSubjectHints(email.subject);
+  const text = buildEmailTextContext(email, 12_000).toLowerCase();
+  const company = inferCompany(null, email, subjectHints);
+  const role = resolveRole(email, company.company, null, subjectHints);
+  const status = inferStatus(text);
+  const transactional = hasTransactionalJobSignal(text);
+  const recipientSpecific = hasRecipientSpecificSignal(text);
+  const promotional = isPromotionalEmail(text);
+  const isJobRelated =
+    !promotional &&
+    transactional &&
+    recipientSpecific &&
+    (isMeaningfulCompany(company.company) || isMeaningfulRole(role.role));
+
+  return {
+    extracted: {
+      isJobRelated,
+      company: isMeaningfulCompany(company.company) ? company.company : "Unknown Company",
+      role: isJobRelated ? role.role : null,
+      dateApplied: null,
+      status,
+      interviewRound: inferInterviewRound(text),
+      platform: senderPlatform,
+    },
+    diagnostics: {
+      aiUsed: false,
+      aiSucceeded: false,
+      companySource: company.source,
+      roleSource: role.source,
+      ambiguousRole: role.ambiguous,
+      roleCandidates: role.candidates,
+      rejectedRoleCandidates: role.rejectedCandidates,
+      normalizedContextLength: text.length,
+    },
   };
 }
 
 function normalizeExtraction(
-  extracted: ExtractedJobData,
-  subject: string,
-  body: string,
+  aiExtracted: ExtractedJobData,
+  email: GmailMessage,
   senderPlatform: string | null,
-  from: string
-): ExtractedJobData {
-  const transactional = hasTransactionalJobSignal(subject, body);
-  const promotional = isPromotionalEmail(subject, body);
-  const recipientSpecific = hasRecipientSpecificSignal(subject, body);
-  const subjectHints = extractSubjectHints(subject);
+  aiUsed: boolean,
+  aiSucceeded: boolean,
+  contextLength: number,
+): JobExtractionResult {
+  const text = buildEmailTextContext(email, 12_000).toLowerCase();
+  const subjectHints = extractSubjectHints(email.subject);
+  const company = inferCompany(aiExtracted.company, email, subjectHints);
+  const role = resolveRole(email, company.company, aiExtracted.role, subjectHints);
 
-  const status = VALID_STATUSES.includes(extracted.status)
-    ? extracted.status
-    : inferStatus(subject, body);
+  let isJobRelated = Boolean(aiExtracted.isJobRelated);
+  const transactional = hasTransactionalJobSignal(text);
+  const recipientSpecific = hasRecipientSpecificSignal(text);
+  const promotional = isPromotionalEmail(text);
 
-  const company = inferCompany(
-    extracted.company,
-    subject,
-    body,
-    from,
-    subjectHints
-  );
-
-  const role = inferRole(subject, body, extracted.role, company, subjectHints);
-
-  let isJobRelated = Boolean(extracted.isJobRelated);
   if (!isJobRelated && transactional && recipientSpecific && !promotional) {
     isJobRelated = true;
   }
@@ -798,53 +995,60 @@ function normalizeExtraction(
     isJobRelated = false;
   }
 
+  const status = VALID_STATUSES.includes(aiExtracted.status)
+    ? aiExtracted.status
+    : inferStatus(text);
+
   return {
-    isJobRelated,
-    company,
-    role,
-    dateApplied: normalizeDateApplied(extracted.dateApplied),
-    status,
-    interviewRound: extracted.interviewRound?.trim() || null,
-    platform:
-      senderPlatform && (!extracted.platform || extracted.platform === "Other")
-        ? senderPlatform
-        : extracted.platform || senderPlatform,
+    extracted: {
+      isJobRelated,
+      company: company.company,
+      role: role.role,
+      dateApplied: normalizeDateApplied(aiExtracted.dateApplied),
+      status,
+      interviewRound:
+        aiExtracted.interviewRound?.trim() || inferInterviewRound(text),
+      platform:
+        senderPlatform && (!aiExtracted.platform || aiExtracted.platform === "Other")
+          ? senderPlatform
+          : aiExtracted.platform || senderPlatform,
+    },
+    diagnostics: {
+      aiUsed,
+      aiSucceeded,
+      companySource: company.source,
+      roleSource: role.source,
+      ambiguousRole: role.ambiguous,
+      roleCandidates: role.candidates,
+      rejectedRoleCandidates: role.rejectedCandidates,
+      normalizedContextLength: contextLength,
+    },
   };
 }
 
-/**
- * Extract job data from an email using Gemini AI
- */
 export async function extractJobData(
-  subject: string,
-  body: string,
+  email: GmailMessage,
   senderPlatform: string | null,
-  from: string
-): Promise<ExtractedJobData> {
-  const deterministicFallback = buildDeterministicExtraction(
-    subject,
-    body,
-    senderPlatform,
-    from
-  );
-
+): Promise<JobExtractionResult> {
+  const deterministic = buildDeterministicResult(email, senderPlatform);
   const apiKey = process.env.GEMINI_API_KEY;
+
   if (!apiKey) {
-    return (
-      deterministicFallback ||
-      buildHeuristicFallback(subject, body, senderPlatform, from)
-    );
+    return deterministic;
+  }
+
+  if (Date.now() < geminiQuotaCooldownUntil) {
+    return buildAiFallbackResult(deterministic);
   }
 
   const model = getGenerativeModel(apiKey);
-
-  const emailContent = `From: ${from}\nDetected Platform: ${senderPlatform || "none"}\nSubject: ${subject}\n\nBody:\n${body}`;
+  const { content, contextLength } = buildModelEmailContext(email, senderPlatform);
 
   try {
     const result = await withTimeout(
-      model.generateContent([EXTRACTION_PROMPT, emailContent]),
+      model.generateContent([EXTRACTION_PROMPT, content]),
       AI_TIMEOUT_MS,
-      "Gemini extraction timed out"
+      "Gemini extraction timed out",
     );
 
     const responseText = result.response.text().trim();
@@ -854,12 +1058,16 @@ export async function extractJobData(
       throw new Error("Unable to parse structured extraction JSON");
     }
 
-    return normalizeExtraction(parsed, subject, body, senderPlatform, from);
+    return normalizeExtraction(parsed, email, senderPlatform, true, true, contextLength);
   } catch (error) {
+    if (isGeminiQuotaError(error)) {
+      const retryMs = getGeminiRetryDelayMs(error);
+      geminiQuotaCooldownUntil = Date.now() + retryMs;
+      warnGeminiQuotaOnce(retryMs);
+      return buildAiFallbackResult(deterministic);
+    }
+
     console.error("Gemini extraction failed:", error);
-    return (
-      deterministicFallback ||
-      buildHeuristicFallback(subject, body, senderPlatform, from)
-    );
+    return buildAiFallbackResult(deterministic);
   }
 }

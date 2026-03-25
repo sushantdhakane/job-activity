@@ -20,6 +20,19 @@ model User {
   updatedAt     DateTime  @updatedAt
 }
 
+model CompanyProfile {
+  id             String           @id @default(cuid())
+  displayName    String
+  normalizedName String           @unique
+  domain         String?
+  logoUrl        String?
+  logoDataUrl    String?          @db.Text
+  logoSource     String?
+  jobApplications JobApplication[]
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+}
+
 model Account {
   id                String  @id @default(cuid())
   userId            String
@@ -57,9 +70,10 @@ model VerificationToken {
 model JobApplication {
   id              String    @id @default(cuid())
   userId          String
+  companyProfileId String?
   gmailMessageId  String    @unique
   company         String
-  role            String
+  role            String?
   dateApplied     DateTime?
   status          String    @default("applied")
   interviewRound  String?
@@ -68,11 +82,13 @@ model JobApplication {
   emailDate       DateTime
   rawExtraction   Json?
   user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  companyProfile  CompanyProfile? @relation(fields: [companyProfileId], references: [id], onDelete: SetNull)
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
   @@index([userId])
   @@index([userId, status])
+  @@index([companyProfileId])
 }
 
 model SyncLog {
